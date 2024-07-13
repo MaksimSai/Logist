@@ -1,0 +1,356 @@
+import logging
+import imaplib
+import email
+import json
+import time
+import schedule
+from email.mime.text import MIMEText
+from smtplib import SMTP, SMTPException
+import telebot
+from telebot import types
+import socket
+import os
+from datetime import datetime
+from openpyxl import load_workbook
+from io import BytesIO
+
+# Загрузка конфигурации из файла
+with open('config.json', 'r') as config_file:
+    config = json.load(config_file)
+
+API_TOKEN = config['API_TOKEN']
+LOGIST_EMAILS = config['LOGIST_EMAILS']
+SMTP_SERVER = config['SMTP_SERVER']
+SMTP_PORT = config['SMTP_PORT']
+SMTP_USERNAME = config['SMTP_USERNAME']
+SMTP_PASSWORD = config['SMTP_PASSWORD']
+IMAP_SERVER = config['IMAP_SERVER']
+IMAP_PORT = config['IMAP_PORT']
+DRIVER_PASSWORD = config['DRIVER_PASSWORD']
+
+logging.basicConfig(level=logging.INFO)
+
+bot = telebot.TeleBot(API_TOKEN)
+
+# Структура данных для заявок
+requests = {
+    'new': [],
+    'in_work': [],
+    'completed': [],
+    'cancelled': []
+}
+
+# Функция для сохранения данных
+def save_requests():
+    with open('requests.json', 'w') as f:
+        json.dump(requests, f)
+    logging.info("Requests saved to file.")
+
+# Функция для загрузки данных
+def load_requests():
+    global requests
+    if os.path.exists('requests.json'):
+        with open('requests.json', 'r') as f:
+            requests = json.load(f)
+        logging.info("Requests loaded from file.")
+    else:
+        logging.info("No saved requests file found. Starting fresh.")
+
+# Загрузка данных при старте
+load_requests()
+
+# Хранение авторизованных пользователей
+authorized_users = set()
+driver_chat_ids = set()
+
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.send_message(message.chat.id, "Введите пароль для доступа:")
+    bot.register_next_step_handler(message, check_password)
+
+def check_password(message):
+    if message.text == DRIVER_PASSWORD:
+        authorized_users.add(message.chat.id)
+        driver_chat_ids.add(message.chat.id)
+        keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        buttons = ["Новые заявки", "В работе", "Выполненные", "Отмененные"]
+        keyboard.add(*buttons)
+        bot.send_message(message.chat.id, "Доступ разрешен. Выберите действие:", reply_markup=keyboard)
+    else:
+        bot.send_message(message.chat.id, "Неверный пароль. Попробуйте снова.")
+        bot.register_next_step_handler(message, check_password)
+
+# Обработка нажатий на кнопки с проверкой авторизации
+@bot.message_handler(func=lambda message: message.text in ["Новые заявки", "В работе", "Выполненные", "Отмененные"])
+def handle_status_buttons(message):
+    if message.chat.id not in authorized_users:
+        bot.send_message(message.chat.id, "У вас нет доступа. Введите пароль для доступа:")
+        bot.register_next_step_handler(message, check_password)
+        return
+    status_mapping = {
+        "Новые заявки": "new",
+        "В работе": "in_work",
+        "Выполненные": "completed",
+        "Отмененные": "cancelled"
+    }
+    status = status_mapping[message.text]
+    logging.info(f"Status button pressed: {status}")
+    logging.info(f"Current requests: {requests}")
+    request_list = requests.get(status, [])
+    logging.info(f"Displaying {status} requests: {request_list}")
+    if request_list:
+        for req in request_list:
+            bot.send_message(message.chat.id, f"Заявка {req['id']}\nАдрес отправки: {req['from']}\nАдрес доставки: {req['to']}\nВес: {req['weight']}\nОписание: {req['description']}\nДата и время поступления: {req['datetime']}\n\nВыберите действие:", reply_markup=generate_request_keyboard(req))
+    else:
+        bot.send_message(message.chat.id, "Нет заявок в этом статусе.")
+
+def generate_request_keyboard(request):
+    keyboard = types.InlineKeyboardMarkup()
+    if request['status'] == 'new':
+        buttons = [
+            types.InlineKeyboardButton(text="Взять в работу", callback_data=f"work_{request['id']}"),
+            types.InlineKeyboardButton(text="Отклонить", callback_data=f"cancel_{request['id']}")
+        ]
+    elif request['status'] == 'in_work':
+        buttons = [
+            types.InlineKeyboardButton(text="Выполнена", callback_data=f"complete_{request['id']}"),
+            types.InlineKeyboardButton(text="Отклонить", callback_data=f"cancel_{request['id']}")
+        ]
+    elif request['status'] in ['completed', 'cancelled']:
+        buttons = [
+            types.InlineKeyboardButton(text="Вернуть в работу", callback_data=f"work_{request['id']}")
+        ]
+    keyboard.add(*buttons)
+    return keyboard
+
+processing_requests = set()
+
+@bot.callback_query_handler(func=lambda call: True)
+def process_callback(call):
+    logging.info(f"Callback received: {call.data}")
+    action, request_id = call.data.split('_')
+    request_id = request_id  # Обработка идентификатора как строки
+
+    if request_id in processing_requests:
+        logging.info(f"Request {request_id} is already being processed.")
+        return
+
+    processing_requests.add(request_id)
+
+    try:
+        request = find_request_by_id(request_id)
+        if request:
+            if action == 'work':
+                update_request_status(request_id, 'in_work')
+                bot.send_message(call.message.chat.id, "Заявка взята в работу.")
+            elif action == 'complete':
+                update_request_status(request_id, 'completed')
+                bot.send_message(call.message.chat.id, "Заявка выполнена.")
+            elif action == 'cancel':
+                update_request_status(request_id, 'cancelled')
+                bot.send_message(call.message.chat.id, "Заявка отклонена.")
+            try:
+                notify_logist(request)
+            except (SMTPException, socket.gaierror) as e:
+                logging.error(f"Failed to send email: {e}")
+                bot.send_message(call.message.chat.id, "Не удалось отправить уведомление логисту.")
+        else:
+            logging.error(f"Request ID {request_id} not found in callback processing")
+    finally:
+        processing_requests.remove(request_id)
+
+def find_request_by_id(request_id):
+    logging.info(f"Finding request by ID: {request_id}")
+    for status in requests:
+        for req in requests[status]:
+            if req['id'] == request_id:
+                logging.info(f"Found request: {req}")
+                return req
+    logging.info(f"Request ID {request_id} not found")
+    return None
+
+def update_request_status(request_id, new_status):
+    logging.info(f"Updating request ID {request_id} to status {new_status}")
+    for status in requests:
+        for req in requests[status]:
+            if req['id'] == request_id:
+                requests[status].remove(req)
+                updated_request = {
+                    'id': req['id'],
+                    'from': req['from'],
+                    'to': req['to'],
+                    'weight': req['weight'],
+                    'description': req['description'],
+                    'datetime': req['datetime'],
+                    'status': new_status,
+                    'sender_email': req['sender_email']
+                }
+                requests[new_status].append(updated_request)
+                logging.info(f"Request {request_id} updated to status {new_status}")
+                save_requests()  # Сохранение данных при обновлении
+                return
+
+def notify_logist(request, is_new=False):
+    if is_new:
+        subject = f"Заявка {request['id']} принята"
+        body = f"Ваша заявка {request['id']} была принята:\nАдрес отправки: {request['from']}\nАдрес доставки: {request['to']}\nВес: {request['weight']}\nОписание: {request['description']}\nДата и время поступления: {request['datetime']}"
+    else:
+        subject = f"Заявка {request['id']} - статус изменен на {request['status']}"
+        body = f"Заявка {request['id']}:\nАдрес отправки: {request['from']}\nАдрес доставки: {request['to']}\nВес: {request['weight']}\nОписание: {request['description']}\nДата и время поступления: {request['datetime']}"
+    logging.info(f"Notifying logist about request {request['id']} with status {request['status']}")
+    
+    sender_email = request.get('sender_email')
+    if sender_email:
+        send_email(sender_email, subject, body)
+    else:
+        logging.error(f"No sender_email found for request {request['id']}")
+
+def send_email(to_email, subject, body):
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = SMTP_USERNAME
+    msg['To'] = to_email
+
+    logging.info(f"Sending email to {to_email} with subject {subject}")
+
+    try:
+        with SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USERNAME, SMTP_PASSWORD)
+            server.sendmail(SMTP_USERNAME, to_email, msg.as_string())
+            logging.info(f"Email sent to {to_email}")
+    except (SMTPException, socket.gaierror) as e:
+        logging.error(f"SMTP error: {e}")
+
+def fetch_new_emails():
+    try:
+        with imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT) as mail:
+            logging.info(f"Connecting to IMAP server {IMAP_SERVER}")
+            mail.login(SMTP_USERNAME, SMTP_PASSWORD)
+            mail.select('inbox')
+            result, data = mail.search(None, '(UNSEEN)')
+            email_ids = data[0].split()
+            logging.info(f"Found {len(email_ids)} new emails.")
+            for e_id in email_ids:
+                result, msg_data = mail.fetch(e_id, '(RFC822)')
+                raw_email = msg_data[0][1]
+                msg = email.message_from_bytes(raw_email)
+                logging.info(f"Processing email ID {e_id.decode('utf-8')}")
+                process_email(msg)
+                mail.store(e_id, '+FLAGS', '\\Seen')
+    except imaplib.IMAP4.error as e:
+        logging.error(f"IMAP error: {e}")
+        time.sleep(15)  # Ожидание перед повторной попыткой
+
+def process_email(msg):
+    from_email = email.utils.parseaddr(msg['from'])[1]
+    if from_email in LOGIST_EMAILS:
+        subject = msg['Subject']
+        is_excel_processed = False
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
+                    file_data = part.get_payload(decode=True)
+                    process_excel_attachment(file_data, from_email)
+                    is_excel_processed = True
+                    break  # Останавливаем обработку после обнаружения и обработки Excel вложения
+        if not is_excel_processed:
+            for part in msg.walk():
+                if part.get_content_type() == 'text/plain':
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        try:
+                            body = payload.decode('utf-8', errors='ignore')
+                            logging.info(f"Email body: {body}")
+                            process_plain_text_email(body, subject, from_email)
+                        except UnicodeDecodeError as e:
+                            logging.error(f"Unicode decode error: {e}")
+                            continue
+    else:
+        logging.warning(f"Email from unauthorized sender: {from_email}")
+
+def process_plain_text_email(body, subject, from_email):
+    request_id = subject.strip()
+    details = parse_email_body(body)
+    new_request = {
+        'id': request_id,
+        'from': details['from'],
+        'to': details['to'],
+        'weight': details['weight'],
+        'description': details['description'],
+        'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'status': 'new',
+        'sender_email': from_email
+    }
+    requests['new'].append(new_request)
+    logging.info(f"New request added: {new_request}")
+    save_requests()
+    notify_logist(new_request, is_new=True)
+    notify_drivers(new_request)
+
+def process_excel_attachment(file_data, from_email):
+    logging.info("Processing Excel attachment")
+    try:
+        workbook = load_workbook(filename=BytesIO(file_data))
+        sheet = workbook.active
+        for row in sheet.iter_rows(min_row=2, values_only=True):
+            request_id, from_addr, to_addr, weight, description = row
+            new_request = {
+                'id': str(request_id),
+                'from': from_addr,
+                'to': to_addr,
+                'weight': weight,
+                'description': description,
+                'datetime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'status': 'new',
+                'sender_email': from_email
+            }
+            requests['new'].append(new_request)
+            logging.info(f"New request added from Excel: {new_request}")
+            notify_logist(new_request, is_new=True)
+            notify_drivers(new_request)
+        save_requests()
+    except Exception as e:
+        logging.error(f"Failed to process Excel attachment: {e}")
+
+def parse_email_body(body):
+    lines = body.splitlines()
+    parsed_body = {
+        'from': lines[0] if len(lines) > 0 else 'Адрес отправки',
+        'to': lines[1] if len(lines) > 1 else 'Адрес доставки',
+        'weight': lines[2] if len(lines) > 2 else 'Вес',
+        'description': lines[3] if len(lines) > 3 else 'Описание'
+    }
+    logging.info(f"Parsed email body: {parsed_body}")
+    return parsed_body
+
+def notify_drivers(request):
+    message = (f"Новая заявка {request['id']}:\n"
+               f"Адрес отправки: {request['from']}\n"
+               f"Адрес доставки: {request['to']}\n"
+               f"Вес: {request['weight']}\n"
+               f"Описание: {request['description']}\n"
+               f"Дата и время поступления: {request['datetime']}")
+    for chat_id in driver_chat_ids:
+        bot.send_message(chat_id, message)
+
+# Запланируем периодический вызов функции fetch_new_emails
+schedule.every(10).seconds.do(fetch_new_emails)
+
+# Запуск бота и периодическое выполнение запланированных задач
+if __name__ == '__main__':
+    def run_bot():
+        while True:
+            try:
+                bot.polling(none_stop=True)
+            except Exception as e:
+                logging.error(f"Error in bot polling: {e}")
+                time.sleep(15)
+
+    import threading
+    bot_thread = threading.Thread(target=run_bot)
+    bot_thread.start()
+
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
